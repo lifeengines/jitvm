@@ -40,6 +40,8 @@ void jitvm_x86_set_saved_rsi(uintptr_t value);
 
 uint32_t jitvm_x86_opcode_length(const uint8_t* bytes, uint32_t available);
 void* jitvm_x86_translated_proc(const uint8_t* bytes, uint32_t available);
+uint32_t jitvm_x86_last_fault(uintptr_t* ip, uint32_t* blocks, uint32_t* used, uint32_t* reserved);
+void jitvm_x86_code_stats(uint32_t* blocks, uint32_t* used, uint32_t* reserved);
 
 typedef struct jitvm_x86_range_filter jitvm_x86_range_filter;
 

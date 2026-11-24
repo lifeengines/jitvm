@@ -323,6 +323,7 @@ static LONG CALLBACK on_fault(EXCEPTION_POINTERS* info) {
 		CloseHandle(log);
 	}
 	CONTEXT* ctx = info->ContextRecord;
+#if defined(_M_X64) || defined(__x86_64__)
 	fprintf(stderr,
 		"  rax=%llX rbx=%llX rcx=%llX rdx=%llX rsi=%llX rdi=%llX\n"
 		"  r8=%llX r9=%llX r10=%llX r11=%llX rsp=%llX rip=%llX\n",
@@ -330,6 +331,14 @@ static LONG CALLBACK on_fault(EXCEPTION_POINTERS* info) {
 		(unsigned long long)ctx->Rdx, (unsigned long long)ctx->Rsi, (unsigned long long)ctx->Rdi,
 		(unsigned long long)ctx->R8, (unsigned long long)ctx->R9, (unsigned long long)ctx->R10,
 		(unsigned long long)ctx->R11, (unsigned long long)ctx->Rsp, (unsigned long long)ctx->Rip);
+#else
+	fprintf(stderr,
+		"  eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X\n"
+		"  ebp=%08X esp=%08X eip=%08X\n",
+		(unsigned)ctx->Eax, (unsigned)ctx->Ebx, (unsigned)ctx->Ecx, (unsigned)ctx->Edx,
+		(unsigned)ctx->Esi, (unsigned)ctx->Edi, (unsigned)ctx->Ebp, (unsigned)ctx->Esp,
+		(unsigned)ctx->Eip);
+#endif
 	fprintf(stderr, "  最近指令\n");
 	for (int i = 0; i < shown; i++) {
 		Trail* t = &g_trail[(start + i) % 24];

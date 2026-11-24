@@ -986,7 +986,13 @@ static void test_relocated_operands() {
 	static const uint8_t kSign64[] = {0x48, 0x83, 0xC0, 0xFF, 0xC3};
 	seed.rax = 0x11111111;
 	REQUIRE(diff_regs(kSign64, sizeof(kSign64), seed));
+#if defined(_M_X64) || defined(__x86_64__)
+	// 0x48 is REX.W: sub rax, 1.
 	REQUIRE(g_last_vm.rax == 0x11111110);
+#else
+	// 32-bit mode decodes 0x48 as DEC EAX, then adds -1.
+	REQUIRE(g_last_vm.rax == 0x1111110F);
+#endif
 	static const uint8_t kPush[] = {
 		0x6A, 0xFF, 0x58,
 		0x68, 0xFF, 0xFF, 0xFF, 0x7F, 0x5B,
@@ -1006,6 +1012,8 @@ static void test_relocated_operands() {
 	REQUIRE((uint32_t)g_last_vm.rax == 15);
 	REQUIRE(diff_regs(kImulB, sizeof(kImulB), seed));
 	REQUIRE((uint32_t)g_last_vm.rax == 21);
+#if defined(_M_X64) || defined(__x86_64__)
+	// Absolute displacements are RIP-relative only in 64-bit mode.
 	static const uint8_t kRip[] = {
 		0x31, 0xC0,
 		0x03, 0x05, 0x07, 0x00, 0x00, 0x00,
@@ -1019,7 +1027,6 @@ static void test_relocated_operands() {
 	REQUIRE((uint32_t)g_last_vm.rax == 13);
 	static const uint8_t kLeaRip[] = {0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00, 0xC3};
 	REQUIRE(diff_regs(kLeaRip, sizeof(kLeaRip), seed));
-#if defined(_M_X64) || defined(__x86_64__)
 	static const uint8_t kGs[] = {0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00, 0xC3};
 	REQUIRE(diff_regs(kGs, sizeof(kGs), seed));
 	static const uint8_t kEnterA[] = {0xC8, 0x10, 0x00, 0x00, 0x48, 0x89, 0xE0, 0xC9, 0xC3};
@@ -1085,6 +1092,10 @@ static void test_rsi_base_and_call_mem() {
 }
 
 static void test_ret_imm_and_far() {
+#if defined(_M_X64) || defined(__x86_64__)
+	// This sequence walks the return address off the entry stack, so it only
+	// matches the 64-bit entry layout; the 32-bit run_native/run_vm prologues
+	// leave a different amount of headroom.
 	static const uint8_t kRet[] = {
 		0x68, 0x10, 0x00, 0x00, 0x00,
 		0x68, 0x20, 0x00, 0x00, 0x00,
@@ -1104,7 +1115,6 @@ static void test_ret_imm_and_far() {
 	REQUIRE(diff_regs(kRet, sizeof(kRet), seed));
 	REQUIRE((uint32_t)g_last_vm.rbx == 0x10);
 	REQUIRE((uint32_t)g_last_vm.rax == 0x30);
-#if defined(_M_X64) || defined(__x86_64__)
 	uint8_t far_bytes[32];
 	memset(far_bytes, 0x90, sizeof(far_bytes));
 	far_bytes[0] = 0xFF;
@@ -1130,6 +1140,8 @@ static void test_ret_imm_and_far() {
 	REQUIRE(vm.rdi == seed.rdi);
 	REQUIRE(vm.rbp == seed.rbp);
 	REQUIRE((vm.rflags & kFlagMask) == (seed.rflags & kFlagMask));
+#else
+	(void)0;
 #endif
 }
 
@@ -1211,6 +1223,8 @@ static void test_more_ops() {
 }
 
 static void test_call_rsp_disp() {
+#if defined(_M_X64) || defined(__x86_64__)
+	// REX.W/RSP-relative: 64-bit only.
 	static const uint8_t kCode[] = {
 		0x48, 0x83, 0xEC, 0x80,
 		0x48, 0x8D, 0x05, 0x0E, 0x00, 0x00, 0x00,
@@ -1224,6 +1238,9 @@ static void test_call_rsp_disp() {
 	NmRegs seed;
 	fill_regs(&seed);
 	REQUIRE(diff_regs(kCode, sizeof(kCode), seed));
+#else
+	(void)0;
+#endif
 }
 
 static bool exec_pair(void* code, const NmRegs& seed) {
@@ -1333,6 +1350,8 @@ static void test_sib_rsi_r12() {
 }
 
 static void test_rex_mem() {
+#if defined(_M_X64) || defined(__x86_64__)
+	// REX.R operands: 64-bit only.
 	static const uint8_t kCode[] = {
 		0x44, 0x8B, 0x01,
 		0x8B, 0x41, 0x04,
@@ -1347,6 +1366,9 @@ static void test_rex_mem() {
 	NmRegs seed;
 	fill_regs(&seed);
 	REQUIRE(diff_code(kCode, sizeof(kCode), seed, mem, sizeof(mem), native_mem, vm_mem));
+#else
+	(void)0;
+#endif
 }
 
 static void test_ymm_across_hook() {
@@ -1380,6 +1402,33 @@ static void test_sse_across_hook() {
 	REQUIRE(ok);
 }
 
+static void test_mov_rsp_index_disp() {
+#if defined(_M_X64) || defined(__x86_64__)
+	// First guest instruction sees RSP = g_guest_stack_top - 0x30.
+	uintptr_t guest_rsp = g_guest_stack_top - 0x30;
+	*(uint64_t*)(guest_rsp + 0x10) = 0x1122334455667788ULL;
+	*(uint64_t*)(guest_rsp + 0x18) = 0x99AABBCCDDEEFF00ULL;
+	static const uint8_t kMov[] = {0x48, 0x8B, 0x7C, 0x0C, 0x10, 0xC3};
+	void* code = publish(kMov, sizeof(kMov));
+	REQUIRE(code != nullptr);
+	NmRegs seed;
+	fill_regs(&seed);
+	seed.rcx = 0;
+	REQUIRE(exec_pair(code, seed));
+	REQUIRE(g_last_vm.rdi == 0x1122334455667788ULL);
+	seed.rcx = 8;
+	REQUIRE(exec_pair(code, seed));
+	REQUIRE(g_last_vm.rdi == 0x99AABBCCDDEEFF00ULL);
+	void* proc = jitvm_x86_translated_proc(kMov, sizeof(kMov));
+	REQUIRE(proc != nullptr);
+	uint8_t stub[2] = {};
+	memcpy(stub, proc, sizeof(stub));
+	REQUIRE(!(stub[0] == 0x0F && stub[1] == 0x0B));
+#else
+	(void)0;
+#endif
+}
+
 static void test_filter_live() {
 	static const uint8_t kCode[] = {0xB8, 0x55, 0x00, 0x00, 0x00, 0xC3};
 	void* code = publish(kCode, sizeof(kCode));
@@ -1400,6 +1449,56 @@ static void test_filter_live() {
 		dump_trace();
 		fail(__LINE__, "filter should exit when ip leaves the guest range");
 	}
+}
+
+#if defined(_M_IX86)
+static unsigned short host_raw_cw() {
+	unsigned short cw = 0;
+	__asm { fnstcw cw }
+	return cw;
+}
+
+static void host_load_cw(unsigned short cw) {
+	__asm { fldcw cw }
+}
+#elif defined(_M_X64) || defined(__x86_64__)
+extern "C" void jitvm_host_fcw_save(unsigned short* out);
+extern "C" void jitvm_host_fcw_load(const unsigned short* in);
+
+static unsigned short host_raw_cw() {
+	unsigned short cw = 0;
+	jitvm_host_fcw_save(&cw);
+	return cw;
+}
+
+static void host_load_cw(unsigned short cw) {
+	jitvm_host_fcw_load(&cw);
+}
+#endif
+
+static void test_host_fcw_preserved() {
+#if defined(_M_IX86) || defined(_M_X64) || defined(__x86_64__)
+	// The guest loads 0x11223344 into the x87 control word (unmasking every
+	// exception). The control word of the calling thread must be the one from
+	// before the VM entry once the VM returns.
+#if defined(_M_X64) || defined(__x86_64__)
+	static const uint8_t kCode[] = {0x68, 0x44, 0x33, 0x22, 0x11, 0xD9, 0x2C, 0x24, 0x48, 0x83, 0xC4, 0x08, 0xC3};
+#else
+	static const uint8_t kCode[] = {0x68, 0x44, 0x33, 0x22, 0x11, 0xD9, 0x2C, 0x24, 0x83, 0xC4, 0x04, 0xC3};
+#endif
+	void* code = publish(kCode, sizeof(kCode));
+	REQUIRE(code != nullptr);
+	unsigned short saved = host_raw_cw();
+	NmRegs vm;
+	fill_regs(&vm);
+	int cv = exec_vm(code, &vm, 0);
+	unsigned short after = host_raw_cw();
+	host_load_cw(saved);
+	REQUIRE(cv == 0);
+	REQUIRE(after == saved);
+#else
+	(void)0;
+#endif
 }
 
 static void run_test(const char* name, void (*fn)()) {
@@ -1481,7 +1580,9 @@ int main(int argc, char** argv) {
 	run_test("rex_mem", test_rex_mem);
 	run_test("ymm_across_hook", test_ymm_across_hook);
 	run_test("sse_across_hook", test_sse_across_hook);
+	run_test("mov_rsp_index_disp", test_mov_rsp_index_disp);
 	run_test("filter_live", test_filter_live);
+	run_test("host_fcw_preserved", test_host_fcw_preserved);
 
 	printf("\njitvm tests: %d passed, %d failed\n", g_passed, g_failed);
 	return g_failed ? 1 : 0;

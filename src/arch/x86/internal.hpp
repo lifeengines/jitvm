@@ -10,6 +10,7 @@ namespace x86 {
 
 Buf begin_code(uint32_t cap);
 void finish_code(Buf& buf);
+void abandon_code(Buf& buf);
 
 uintptr_t tail_for(uint32_t length);
 uintptr_t dispatch_target(bool flow);
@@ -21,6 +22,7 @@ bool flow_enabled();
 int branch_extras(const Decoded& inst, int* extra, int cap);
 uintptr_t set_branch(const uint8_t* ip, uint32_t iclen, uintptr_t proc, const int* extra, int nextra);
 uintptr_t translate(const uint8_t* ip);
+void mark_translate_fault(const uint8_t* ip, uint32_t why);
 
 }  // namespace x86
 }  // namespace jitvm

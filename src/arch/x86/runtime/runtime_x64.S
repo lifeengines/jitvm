@@ -25,6 +25,14 @@
 .text
 .globl CSYM(jitvm_link_entry)
 .globl CSYM(jitvm_ensure_entry)
+.globl CSYM(jitvm_host_fcw_save)
+.globl CSYM(jitvm_host_fcw_load)
+
+#if defined(_WIN32)
+#define ARG1 rcx
+#else
+#define ARG1 rdi
+#endif
 
 # rax = callee, rdx = rcx argument. Returns the callee's rax.
 # Preserves x87/SSE/AVX across the call and restores rsp.
@@ -219,4 +227,14 @@ CSYM(jitvm_ensure_entry):
 	pop rcx
 	pop rax
 	popfq
+	ret
+
+# void jitvm_host_fcw_save(unsigned short* out)
+CSYM(jitvm_host_fcw_save):
+	fnstcw word ptr [ARG1]
+	ret
+
+# void jitvm_host_fcw_load(const unsigned short* in)
+CSYM(jitvm_host_fcw_load):
+	fldcw word ptr [ARG1]
 	ret

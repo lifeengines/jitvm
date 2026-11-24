@@ -6,6 +6,8 @@ EXTERN jitvm_ensure_stack:PROC
 
 PUBLIC jitvm_link_entry
 PUBLIC jitvm_ensure_entry
+PUBLIC jitvm_host_fcw_save
+PUBLIC jitvm_host_fcw_load
 
 .code
 
@@ -198,5 +200,17 @@ jitvm_ensure_entry PROC
 	popfq
 	ret
 jitvm_ensure_entry ENDP
+
+; void jitvm_host_fcw_save(unsigned short* out)
+jitvm_host_fcw_save PROC
+	fnstcw word ptr [rcx]
+	ret
+jitvm_host_fcw_save ENDP
+
+; void jitvm_host_fcw_load(const unsigned short* in)
+jitvm_host_fcw_load PROC
+	fldcw word ptr [rcx]
+	ret
+jitvm_host_fcw_load ENDP
 
 END

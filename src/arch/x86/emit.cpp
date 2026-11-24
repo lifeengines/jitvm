@@ -30,7 +30,8 @@ uintptr_t install_at(const Decoded& inst, uint32_t iclen, uintptr_t proc, const 
 	return set_branch(inst.bytes, iclen, proc, extra, nextra);
 }
 
-uintptr_t install_error(const Decoded& inst, uint32_t iclen, const int* extra, int nextra) {
+uintptr_t install_error(const Decoded& inst, uint32_t iclen, const int* extra, int nextra, uint32_t why = 0) {
+	mark_translate_fault(inst.bytes, why);
 	return install_at(inst, iclen, error_proc(), extra, nextra);
 }
 
@@ -490,8 +491,10 @@ const ZydisDecodedOperand* explicit_mem(const Decoded& inst) {
 
 uintptr_t emit_copy(const Decoded& inst, uint32_t iclen, bool force_rsi, const int* extra, int nextra) {
 	Buf buf = begin_code(96);
-	if (!buf_ok(buf))
-		return install_error(inst, iclen, extra, nextra);
+	if (!buf_ok(buf)) {
+		mark_translate_fault(inst.bytes, 2);
+		return error_proc();
+	}
 	bool rsi = force_rsi || refs_reg(inst, rsi_reg());
 	if (rsi)
 		emit_mov_reg_ctx(buf, rsi_reg(), SLOT_RSI);
@@ -503,10 +506,17 @@ uintptr_t emit_copy(const Decoded& inst, uint32_t iclen, bool force_rsi, const i
 	return install_at(inst, iclen, (uintptr_t)buf.start, extra, nextra);
 }
 
+uintptr_t fail_reencode(Buf& buf, const Decoded& inst, uint32_t iclen, const Plan& plan, uint32_t why) {
+	abandon_code(buf);
+	return install_error(inst, iclen, plan.extra, plan.nextra, why);
+}
+
 uintptr_t emit_reencode(const Decoded& inst, uint32_t iclen, const Plan& plan) {
 	Buf buf = begin_code(640);
-	if (!buf_ok(buf))
-		return install_error(inst, iclen, plan.extra, plan.nextra);
+	if (!buf_ok(buf)) {
+		mark_translate_fault(inst.bytes, 3);
+		return error_proc();
+	}
 	bool rsi_guest = false;
 	bool uses_rsi = refs_reg(inst, rsi_reg());
 	emit_mov_reg_ctx(buf, rsi_reg(), SLOT_IP);
@@ -535,7 +545,7 @@ uintptr_t emit_reencode(const Decoded& inst, uint32_t iclen, const Plan& plan) {
 				continue;
 			ZydisRegister dst = seen == 0 ? plan.imm[0] : plan.imm[1];
 			if (!emit_load_imm(buf, dst, inst, (int)i))
-				return install_error(inst, iclen, plan.extra, plan.nextra);
+				return fail_reencode(buf, inst, iclen, plan, 5);
 			seen++;
 			if (seen >= 2)
 				break;
@@ -544,7 +554,7 @@ uintptr_t emit_reencode(const Decoded& inst, uint32_t iclen, const Plan& plan) {
 	if (plan.fold) {
 		const ZydisDecodedOperand* mem = explicit_mem(inst);
 		if (!mem || !emit_ea(buf, inst, *mem, plan.ea, plan.vsib, &rsi_guest))
-			return install_error(inst, iclen, plan.extra, plan.nextra);
+			return fail_reencode(buf, inst, iclen, plan, 4);
 	}
 	if (uses_rsi && !rsi_guest)
 		emit_mov_reg_ctx(buf, rsi_reg(), SLOT_RSI);
@@ -553,9 +563,9 @@ uintptr_t emit_reencode(const Decoded& inst, uint32_t iclen, const Plan& plan) {
 	ZydisRegister i0 = plan.substitute ? plan.imm[0] : rdi_reg();
 	ZydisRegister i1 = plan.substitute && plan.nimm > 1 ? plan.imm[1] : rdi_reg();
 	if (!rewrite_request(inst, plan.fold, plan.substitute, ea, i0, i1, &req))
-		return install_error(inst, iclen, plan.extra, plan.nextra);
+		return fail_reencode(buf, inst, iclen, plan, 6);
 	if (!emit_encoded(buf, &req))
-		return install_error(inst, iclen, plan.extra, plan.nextra);
+		return fail_reencode(buf, inst, iclen, plan, 7);
 	if (uses_rsi)
 		emit_mov_ctx_reg(buf, SLOT_RSI, rsi_reg());
 	for (int i = ns - 1; i >= 0; i--) {
@@ -1063,8 +1073,10 @@ int branch_extras(const Decoded& inst, int* extra, int cap) {
 
 uintptr_t translate_insn(const uint8_t* ip) {
 	Decoded inst;
-	if (!decode_bytes(ip, 15, &inst))
+	if (!decode_bytes(ip, 15, &inst)) {
+		mark_translate_fault(ip, 8);
 		return error_proc();
+	}
 	uint32_t iclen = opcode_length(inst);
 	ZydisMnemonic mn = inst.dec.mnemonic;
 	if (mn == ZYDIS_MNEMONIC_INT || mn == ZYDIS_MNEMONIC_INT1 || mn == ZYDIS_MNEMONIC_INT3 ||
@@ -1119,7 +1131,7 @@ uintptr_t translate_insn(const uint8_t* ip) {
 	Plan plan;
 	make_plan(inst, &plan);
 	if (plan.kind == PLAN_ERROR)
-		return install_error(inst, iclen, nullptr, 0);
+		return install_error(inst, iclen, nullptr, 0, 1);
 	if (plan.kind == PLAN_COPY)
 		return emit_copy(inst, iclen, false, plan.extra, plan.nextra);
 	return emit_reencode(inst, iclen, plan);

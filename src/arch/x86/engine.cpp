@@ -182,13 +182,17 @@ void emit_call_hook(Buf& buf, int kind) {
 		buf.raw("\x48\x83\xC4\x20", 4);
 #endif
 	} else {
-		buf.raw("\x8B\x8C\x24", 3);
-		buf.d(g_fp_size);
-		buf.b(0xBA);
+		// 32-bit hosts call the hook with the C (cdecl) convention: the image and
+		// kind must be on the stack. The image slot moves up by one dword after
+		// pushing kind, hence fp_size + 4.
+		buf.b(0x68);
 		buf.d((uint32_t)kind);
+		buf.raw("\xFF\xB4\x24", 3);
+		buf.d(g_fp_size + 4);
 		buf.b(0xB8);
 		buf.d((uint32_t)(uintptr_t)&jitvm_x86_hook);
 		buf.raw("\xFF\xD0", 2);
+		buf.raw("\x83\xC4\x08", 3);
 	}
 }
 
@@ -277,6 +281,8 @@ void emit_table_jump(Buf& buf, uintptr_t* table, int level) {
 
 uintptr_t* new_table() {
 	Buf buf = begin_code((uint32_t)(sizeof(uintptr_t) * 256));
+	if (!buf.p)
+		return nullptr;
 	uintptr_t* table = (uintptr_t*)buf.p;
 	uintptr_t link = (uintptr_t)&jitvm_link_entry;
 	for (int i = 0; i < 256; i++)
@@ -298,7 +304,109 @@ uintptr_t* table_of(uintptr_t code) {
 	return nullptr;
 }
 
+#if defined(JITVM_HOST_X64)
+// The guest runs on the host x87/SSE state, so a guest fldcw/fninit would
+// otherwise change the control word of the calling thread for good. Keep the
+// control word that was live when the VM was entered and put it back on the
+// way out. Only the control word is preserved; the x87/SSE register bank is
+// still shared with the guest by design.
+extern "C" void jitvm_host_fcw_save(unsigned short* out);
+extern "C" void jitvm_host_fcw_load(const unsigned short* in);
+
+thread_local uint16_t g_host_fcw = 0;
+
+void host_fcw_save() {
+	jitvm_host_fcw_save(&g_host_fcw);
+}
+
+void host_fcw_restore() {
+	jitvm_host_fcw_load(&g_host_fcw);
+}
+#elif defined(JITVM_HOST_X86)
+thread_local uint16_t g_host_fcw = 0;
+
+void host_fcw_save() {
+	unsigned short cw = 0;
+#if defined(_MSC_VER)
+	__asm { fnstcw cw }
+#else
+	__asm__ volatile("fnstcw %0" : "=m"(cw));
+#endif
+	g_host_fcw = cw;
+}
+
+void host_fcw_restore() {
+	unsigned short cw = g_host_fcw;
+#if defined(_MSC_VER)
+	__asm { fldcw cw }
+#else
+	__asm__ volatile("fldcw %0" : : "m"(cw));
+#endif
+}
+#endif
+
+#if defined(JITVM_HOST_X86) || defined(JITVM_HOST_X64)
+void emit_call_helper(Buf& buf, void (*fn)()) {
+	buf.b(0xE8);
+	uint8_t* at = buf.p;
+	buf.d(0);
+	int32_t rel = (int32_t)((intptr_t)fn - (intptr_t)(at + 4));
+	memcpy(at, &rel, 4);
+}
+
+void emit_host_fcw_save(Buf& buf) {
+#if defined(JITVM_HOST_X64)
+	// Save flags and every GPR, align the stack for a C call, invoke the
+	// helper, then restore the exact frame. RBP is used as the frame pointer
+	// and the helper preserves it.
+	buf.b(0x9C);
+	emit_pusha(buf);
+	buf.raw("\x48\x89\xE5", 3);
+	buf.raw("\x48\x83\xE4\xF0", 4);
+	buf.raw("\x48\x83\xEC\x20", 4);
+	buf.raw("\x48\xB8", 2);
+	buf.q((uint64_t)(uintptr_t)&host_fcw_save);
+	buf.raw("\xFF\xD0", 2);
+	buf.raw("\x48\x89\xEC", 3);
+	emit_popa(buf);
+	buf.b(0x9D);
+#else
+	buf.b(0x9C);
+	buf.b(0x60);
+	emit_call_helper(buf, &host_fcw_save);
+	buf.b(0x61);
+	buf.b(0x9D);
+#endif
+}
+
+void emit_host_fcw_restore(Buf& buf) {
+#if defined(JITVM_HOST_X64)
+	buf.b(0x9C);
+	emit_pusha(buf);
+	buf.raw("\x48\x89\xE5", 3);
+	buf.raw("\x48\x83\xE4\xF0", 4);
+	buf.raw("\x48\x83\xEC\x20", 4);
+	buf.raw("\x48\xB8", 2);
+	buf.q((uint64_t)(uintptr_t)&host_fcw_restore);
+	buf.raw("\xFF\xD0", 2);
+	buf.raw("\x48\x89\xEC", 3);
+	emit_popa(buf);
+	buf.b(0x9D);
+#else
+	buf.b(0x9C);
+	buf.b(0x60);
+	emit_call_helper(buf, &host_fcw_restore);
+	buf.b(0x61);
+	buf.b(0x9D);
+#endif
+}
+#else
+void emit_host_fcw_save(Buf&) {}
+void emit_host_fcw_restore(Buf&) {}
+#endif
+
 void emit_leave_native(Buf& buf) {
+	emit_host_fcw_restore(buf);
 	buf.b(0x9D);
 	buf.b(0x5C);
 	emit_xchg_rsi_ctx(buf);
@@ -463,13 +571,17 @@ void emit_framed_hook(Buf& buf, int kind, bool always_leave) {
 }
 
 uintptr_t emit_level_dispatch(int level, int kind) {
-	Buf buf = begin_code(level == 0 ? 1280 : 64);
+	Buf buf = begin_code(level == 0 ? 1664 : 64);
+	if (!buf.start)
+		return error_proc();
 	uint8_t* entry = buf.start;
 	uintptr_t* table = nullptr;
 	if (level == 0) {
 		if (!g_root)
 			g_root = new_table();
 		table = g_root;
+		if (!table)
+			return error_proc();
 		buf.b(0xE9);
 		uint8_t* rel = buf.p;
 		buf.d(0);
@@ -500,6 +612,8 @@ uintptr_t emit_level_dispatch(int level, int kind) {
 		}
 	} else {
 		table = new_table();
+		if (!table)
+			return error_proc();
 		emit_table_jump(buf, table, level);
 	}
 	finish_code(buf);
@@ -534,8 +648,19 @@ Buf begin_code(uint32_t cap) {
 }
 
 void finish_code(Buf& buf) {
-	if (buf.start)
-		code_flush(buf.start, buf.used());
+	if (!buf.start)
+		return;
+	code_rewind(buf.start, (uint32_t)(buf.end - buf.start), (uint32_t)buf.used());
+	code_flush(buf.start, buf.used());
+}
+
+void abandon_code(Buf& buf) {
+	if (!buf.start)
+		return;
+	code_rewind(buf.start, (uint32_t)(buf.end - buf.start), 0);
+	buf.start = nullptr;
+	buf.p = nullptr;
+	buf.end = nullptr;
 }
 
 uintptr_t tail_for(uint32_t length) {
@@ -668,7 +793,8 @@ extern "C" uintptr_t jitvm_op_link(uintptr_t) {
 namespace {
 
 uintptr_t make_clean_exit() {
-	Buf buf = begin_code(32);
+	Buf buf = begin_code(256);
+	emit_host_fcw_restore(buf);
 	emit_push_ctx(buf, SLOT_IP);
 	emit_mov_reg_ctx(buf, cursor_reg(), SLOT_RSI);
 	buf.b(0xC3);
@@ -684,7 +810,7 @@ uintptr_t make_error() {
 }
 
 uintptr_t make_exit_callback() {
-	Buf buf = begin_code(800);
+	Buf buf = begin_code(1280);
 	emit_mov_reg_ctx(buf, cursor_reg(), SLOT_IP);
 	emit_framed_hook(buf, 2, true);
 	finish_code(buf);
@@ -702,7 +828,8 @@ uintptr_t make_tail(uint32_t length) {
 }
 
 uintptr_t make_enter() {
-	Buf buf = begin_code(256);
+	Buf buf = begin_code(512);
+	emit_host_fcw_save(buf);
 	emit_mov_ctx_reg(buf, SLOT_RSI, cursor_reg());
 	buf.b(0x9C);
 	emit_cmp_ctx_zero(buf, SLOT_STACK);
@@ -770,6 +897,34 @@ jitvm_enter_fn prepare(const jitvm_config* cfg) {
 	patch_monitor(g_flow_rel, g_flow_skip_filter, g_flow_skip_all, JITVM_MONITOR_SKIP_FILTER);
 	g_enter = (jitvm_enter_fn)make_enter();
 	return g_enter;
+}
+
+namespace {
+struct TranslateFaultRec {
+	uintptr_t ip;
+	uint32_t why;
+	uint32_t blocks;
+	uint32_t used;
+	uint32_t reserved;
+} g_translate_fault;
+}
+
+void mark_translate_fault(const uint8_t* ip, uint32_t why) {
+	g_translate_fault.ip = (uintptr_t)ip;
+	g_translate_fault.why = why;
+	code_account(&g_translate_fault.blocks, &g_translate_fault.used, &g_translate_fault.reserved);
+}
+
+uint32_t last_translate_fault(uintptr_t* ip, uint32_t* blocks, uint32_t* used, uint32_t* reserved) {
+	if (ip)
+		*ip = g_translate_fault.ip;
+	if (blocks)
+		*blocks = g_translate_fault.blocks;
+	if (used)
+		*used = g_translate_fault.used;
+	if (reserved)
+		*reserved = g_translate_fault.reserved;
+	return g_translate_fault.why;
 }
 
 uintptr_t translate(const uint8_t* ip) {
@@ -937,4 +1092,12 @@ extern "C" uint32_t jitvm_x86_opcode_length(const uint8_t* bytes, uint32_t avail
 
 extern "C" void* jitvm_x86_translated_proc(const uint8_t* bytes, uint32_t available) {
 	return jitvm::x86::lookup_proc(bytes, available);
+}
+
+extern "C" uint32_t jitvm_x86_last_fault(uintptr_t* ip, uint32_t* blocks, uint32_t* used, uint32_t* reserved) {
+	return jitvm::x86::last_translate_fault(ip, blocks, used, reserved);
+}
+
+extern "C" void jitvm_x86_code_stats(uint32_t* blocks, uint32_t* used, uint32_t* reserved) {
+	jitvm::code_account(blocks, used, reserved);
 }
